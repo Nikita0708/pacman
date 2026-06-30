@@ -12,7 +12,9 @@ import { BattleHUD } from '@/components/BattleHUD';
 import type { BattleResult } from '@/components/BattleHUD';
 import { useGameEngine } from '@/hooks/useGameEngine';
 import { GameState } from '@/engine/types';
-import type { BattleMode } from '@/types/battle';
+import type { BattleMode, BattleView } from '@/types/battle';
+
+const BATTLE_KEY = 'neopacman_battle';
 
 // ── Battle state ───────────────────────────────────────────────────────────────
 
@@ -43,11 +45,63 @@ export default function HomePage() {
   const scoreRef = useRef(0);
   const battleSubmittedRef = useRef(false);
   const regularSubmittedRef = useRef(false);
+  const restoredRef = useRef(false); // run the restore check exactly once per session load
 
   // Keep scoreRef in sync without adding snapshot to heavy deps
   useEffect(() => {
     scoreRef.current = snapshot.score;
   }, [snapshot.score]);
+
+  // ── Restore battle after page reload ────────────────────────────────────────
+  // Runs once as soon as the session is authenticated. Reads the saved battleId
+  // from localStorage, fetches current status from the server and either resumes
+  // the battle (active), shows the result (complete) or clears the stale entry.
+  useEffect(() => {
+    if (!session?.user || restoredRef.current) return;
+    restoredRef.current = true;
+
+    const raw = localStorage.getItem(BATTLE_KEY);
+    if (!raw) return;
+
+    let saved: ActiveBattle;
+    try {
+      saved = JSON.parse(raw) as ActiveBattle;
+    } catch {
+      localStorage.removeItem(BATTLE_KEY);
+      return;
+    }
+
+    void fetch(`/api/battle/${saved.battleId}`)
+      .then(async (r) => {
+        if (!r.ok) { localStorage.removeItem(BATTLE_KEY); return; }
+        const view = (await r.json()) as BattleView;
+
+        if (view.status === 'active') {
+          // Resume — start a fresh game with the same mode/lives
+          battleSubmittedRef.current = false;
+          setActiveBattle(saved);
+          setPhase('battle_active');
+          start(saved.mode);
+        } else if (view.status === 'complete') {
+          // Battle finished while we were away — show result immediately
+          const won =
+            view.winnerId === 'draw' ? null : view.winnerId === view.me.userId;
+          setBattleResult({
+            won,
+            myScore: view.me.finalScore ?? 0,
+            opponentScore: view.opponent?.finalScore ?? 0,
+            opponentName: view.opponent?.name ?? saved.opponentName,
+            eloChange: view.myEloChange,
+          });
+          setPhase('battle_result');
+          localStorage.removeItem(BATTLE_KEY);
+        } else {
+          // Waiting (never got an opponent) or cancelled — just clear
+          localStorage.removeItem(BATTLE_KEY);
+        }
+      })
+      .catch(() => localStorage.removeItem(BATTLE_KEY));
+  }, [session, start]);
 
   // ── Regular leaderboard submission ──────────────────────────────────────────
   useEffect(() => {
@@ -103,19 +157,23 @@ export default function HomePage() {
     opponentName: string,
     opponentElo: number,
   ) => {
+    const battle: ActiveBattle = { battleId, mode, opponentName, opponentElo };
+    localStorage.setItem(BATTLE_KEY, JSON.stringify(battle));
     battleSubmittedRef.current = false;
-    setActiveBattle({ battleId, mode, opponentName, opponentElo });
+    setActiveBattle(battle);
     setPhase('battle_active');
     start(mode);
   };
 
   const handleBattleComplete = (result: BattleResult) => {
+    localStorage.removeItem(BATTLE_KEY);
     setBattleResult(result);
     setPhase('battle_result');
     setLeaderboardVersion((v) => v + 1);
   };
 
   const closeBattleResult = () => {
+    localStorage.removeItem(BATTLE_KEY);
     setActiveBattle(null);
     setBattleResult(null);
     setPhase('normal');
