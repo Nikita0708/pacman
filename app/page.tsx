@@ -29,6 +29,7 @@ type AppPhase =
   | 'normal'          // regular play, no PvP
   | 'pvp_modal'       // mode selection / matchmaking dialog
   | 'battle_active'   // battle in progress
+  | 'battle_wait'     // finished / forfeited — waiting for the battle to resolve
   | 'battle_result';  // showing W/L/D result
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -40,6 +41,7 @@ export default function HomePage() {
   const [phase, setPhase] = useState<AppPhase>('normal');
   const [activeBattle, setActiveBattle] = useState<ActiveBattle | null>(null);
   const [battleResult, setBattleResult] = useState<BattleResult | null>(null);
+  const [forfeited, setForfeited] = useState(false); // true when battle_wait was reached via reload-forfeit
   const [leaderboardVersion, setLeaderboardVersion] = useState(0);
 
   const scoreRef = useRef(0);
@@ -53,9 +55,9 @@ export default function HomePage() {
   }, [snapshot.score]);
 
   // ── Restore battle after page reload ────────────────────────────────────────
-  // Runs once as soon as the session is authenticated. Reads the saved battleId
-  // from localStorage, fetches current status from the server and either resumes
-  // the battle (active), shows the result (complete) or clears the stale entry.
+  // Runs once as soon as the session is authenticated. Reloading the page during
+  // a live battle counts as a FORFEIT — you can't replay to improve your score.
+  // Your last pushed score is locked in and the battle is resolved as a loss.
   useEffect(() => {
     if (!session?.user || restoredRef.current) return;
     restoredRef.current = true;
@@ -71,37 +73,92 @@ export default function HomePage() {
       return;
     }
 
-    void fetch(`/api/battle/${saved.battleId}`)
-      .then(async (r) => {
+    void (async () => {
+      let view: BattleView;
+      try {
+        const r = await fetch(`/api/battle/${saved.battleId}`);
         if (!r.ok) { localStorage.removeItem(BATTLE_KEY); return; }
-        const view = (await r.json()) as BattleView;
+        view = (await r.json()) as BattleView;
+      } catch {
+        localStorage.removeItem(BATTLE_KEY);
+        return;
+      }
 
-        if (view.status === 'active') {
-          // Resume — start a fresh game with the same mode/lives
-          battleSubmittedRef.current = false;
+      if (view.status === 'active') {
+        if (view.me.done) {
+          // Already finished legitimately — just wait for the opponent's result.
+          setForfeited(false);
           setActiveBattle(saved);
-          setPhase('battle_active');
-          start(saved.mode);
-        } else if (view.status === 'complete') {
-          // Battle finished while we were away — show result immediately
+          setPhase('battle_wait');
+        } else {
+          // Reloaded mid-game → forfeit. Locks in the last score, counts as a loss.
+          await fetch(`/api/battle/${saved.battleId}/forfeit`, { method: 'POST' }).catch(() => {});
+          setForfeited(true);
+          setActiveBattle(saved);
+          setPhase('battle_wait');
+        }
+      } else if (view.status === 'complete') {
+        // Battle finished while we were away — show result immediately.
+        const won =
+          view.winnerId === 'draw' ? null : view.winnerId === view.me.userId;
+        setBattleResult({
+          won,
+          myScore: view.me.finalScore ?? 0,
+          opponentScore: view.opponent?.finalScore ?? 0,
+          opponentName: view.opponent?.name ?? saved.opponentName,
+          eloChange: view.myEloChange,
+        });
+        setPhase('battle_result');
+        localStorage.removeItem(BATTLE_KEY);
+      } else {
+        // Waiting (never got an opponent) or cancelled — just clear.
+        localStorage.removeItem(BATTLE_KEY);
+      }
+    })();
+  }, [session]);
+
+  // ── Resolve a waiting battle (after reload/forfeit) ─────────────────────────
+  // Polls until the battle is complete, then surfaces the W/L/D result modal.
+  useEffect(() => {
+    if (phase !== 'battle_wait' || !activeBattle) return;
+    let alive = true;
+
+    const check = async () => {
+      try {
+        const view = (await fetch(`/api/battle/${activeBattle.battleId}`).then((r) =>
+          r.json(),
+        )) as BattleView;
+        if (!alive) return;
+        if (view.status === 'complete') {
           const won =
             view.winnerId === 'draw' ? null : view.winnerId === view.me.userId;
+          localStorage.removeItem(BATTLE_KEY);
           setBattleResult({
             won,
             myScore: view.me.finalScore ?? 0,
             opponentScore: view.opponent?.finalScore ?? 0,
-            opponentName: view.opponent?.name ?? saved.opponentName,
+            opponentName: view.opponent?.name ?? activeBattle.opponentName,
             eloChange: view.myEloChange,
           });
           setPhase('battle_result');
+          setLeaderboardVersion((v) => v + 1);
+        } else if (view.status === 'cancelled') {
           localStorage.removeItem(BATTLE_KEY);
-        } else {
-          // Waiting (never got an opponent) or cancelled — just clear
-          localStorage.removeItem(BATTLE_KEY);
+          setActiveBattle(null);
+          setPhase('normal');
         }
-      })
-      .catch(() => localStorage.removeItem(BATTLE_KEY));
-  }, [session, start]);
+      } catch {
+        // ignore transient errors, keep polling
+      }
+    };
+
+    void check();
+    const iv = setInterval(() => void check(), 2000);
+    return () => {
+      alive = false;
+      clearInterval(iv);
+    };
+  }, [phase, activeBattle]);
 
   // ── Regular leaderboard submission ──────────────────────────────────────────
   useEffect(() => {
@@ -176,6 +233,7 @@ export default function HomePage() {
     localStorage.removeItem(BATTLE_KEY);
     setActiveBattle(null);
     setBattleResult(null);
+    setForfeited(false);
     setPhase('normal');
   };
 
@@ -271,6 +329,38 @@ export default function HomePage() {
           onBattleStart={handleBattleStart}
           onClose={() => setPhase('normal')}
         />
+      )}
+
+      {/* Forfeit / waiting-for-result overlay (after a reload mid-battle) */}
+      {phase === 'battle_wait' && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-2xl border border-blue-500/30 bg-slate-900 p-6 text-center shadow-[0_0_60px_rgba(59,130,246,0.3)]">
+            <div className="mb-4 flex justify-center">
+              <span className="inline-block h-7 w-7 animate-spin rounded-full border-2 border-cyan-400 border-t-transparent" />
+            </div>
+            {forfeited ? (
+              <>
+                <h2 className="mb-2 font-mono text-lg font-extrabold uppercase tracking-[0.25em] text-red-400">
+                  Бой покинут
+                </h2>
+                <p className="font-mono text-xs leading-relaxed text-slate-400">
+                  Перезагрузка во время боя засчитана как поражение.
+                  <br />
+                  Твой счёт сохранён. Ждём результат…
+                </p>
+              </>
+            ) : (
+              <>
+                <h2 className="mb-2 font-mono text-lg font-extrabold uppercase tracking-[0.25em] text-cyan-300">
+                  Ожидание
+                </h2>
+                <p className="font-mono text-xs leading-relaxed text-slate-400">
+                  Ждём, пока соперник завершит свою игру…
+                </p>
+              </>
+            )}
+          </div>
+        </div>
       )}
 
       {/* Battle result modal */}
