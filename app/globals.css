@@ -1,0 +1,24 @@
+@import "tailwindcss";
+
+:root {
+  --color-background: #0f172a;
+  --color-foreground: #e2e8f0;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background-color: var(--color-background);
+  color: var(--color-foreground);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* The canvas owns its own pixel scaling; never let the browser smooth it. */
+canvas {
+  image-rendering: auto;
+  touch-action: none;
+}
